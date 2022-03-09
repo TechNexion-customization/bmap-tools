@@ -419,8 +419,12 @@ def open_files(args):
         dest_obj.close()
         dest_obj = open_block_device(args.dest)
 
+    defer_obj = None
+    if args.blocks_defer or args.bytes_defer:
+        defer_obj = open('/tmp/defer_obj.bin', 'wb+')
+
     return (image_obj, dest_obj, bmap_obj, bmap_path, image_obj.size,
-            dest_is_blkdev)
+            dest_is_blkdev, defer_obj)
 
 
 def copy_command(args):
@@ -432,12 +436,21 @@ def copy_command(args):
     if args.bmap_sig and args.no_sig_verify:
         error_out("--bmap-sig and --no-sig-verify cannot be used together")
 
-    image_obj, dest_obj, bmap_obj, bmap_path, image_size, dest_is_blkdev = \
+    image_obj, dest_obj, bmap_obj, bmap_path, image_size, dest_is_blkdev, defer_obj = \
         open_files(args)
 
     if args.bmap_sig and not bmap_obj:
         error_out("the bmap signature file was specified, but bmap file was "
                   "not found")
+
+    if args.blocks_defer and args.bytes_defer:
+        error_out("--blocks-defer and --bytes-defer cannot be used together")
+
+    if args.blocks_defer and not isinstance(args.blocks_defer,int):
+        error_out("--blocks-defer only allow integer.")
+
+    if args.bytes_defer and not isinstance(args.bytes_defer,int):
+        error_out("--bytes-defer only allow integer.")
 
     f_obj = verify_bmap_signature(args, bmap_obj, bmap_path)
     if f_obj:
@@ -451,12 +464,12 @@ def copy_command(args):
         if dest_is_blkdev:
             dest_str = "block device '%s'" % args.dest
             # For block devices, use the specialized class
-            writer = BmapCopy.BmapBdevCopy(image_obj, dest_obj, bmap_obj,
-                                           image_size)
+            writer = BmapCopy.BmapBdevCopy(image_obj, dest_obj, defer_obj, bmap_obj,
+                                           image_size, args.blocks_defer, args.bytes_defer)
         else:
             dest_str = "file '%s'" % os.path.basename(args.dest)
-            writer = BmapCopy.BmapCopy(image_obj, dest_obj, bmap_obj,
-                                       image_size)
+            writer = BmapCopy.BmapCopy(image_obj, dest_obj, defer_obj, bmap_obj,
+                                       image_size, args.blocks_defer, args.bytes_defer)
     except BmapCopy.Error as err:
         error_out(err)
 
@@ -505,11 +518,14 @@ def copy_command(args):
     log.info("copying time: %s, copying speed %s/sec"
              % (BmapHelpers.human_time(copying_time),
                 BmapHelpers.human_size(copying_speed)))
-
+    if defer_obj:
+        defer_obj.close()
     dest_obj.close()
     if bmap_obj:
         bmap_obj.close()
     image_obj.close()
+    if os.path.exists("/tmp/defer_obj.bin"):
+        os.remove("/tmp/defer_obj.bin")
 
 
 def create_command(args):
@@ -646,6 +662,18 @@ def parse_arguments():
     # The --psplash-pipe option
     text = "write progress to a psplash pipe"
     parser_copy.add_argument("--psplash-pipe", help=text)
+    
+    # Write the defer part to the temporary file, 
+    # until the non-defer part is written to the disk, 
+    # the defer part will be written to the disk.
+
+    # The --blocks-defer option
+    text = "write defer blocks to temp file"
+    parser_copy.add_argument("--blocks-defer", help=text, type=int)
+
+    # The --blocks-defer option
+    text = "write defer bytes to temp file"
+    parser_copy.add_argument("--bytes-defer", help=text, type=int)
 
     return parser.parse_args()
 

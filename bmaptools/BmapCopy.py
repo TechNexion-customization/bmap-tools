@@ -131,7 +131,7 @@ class BmapCopy(object):
     instance.
     """
 
-    def __init__(self, image, dest, bmap=None, image_size=None):
+    def __init__(self, image, dest, defer_obj=None, bmap=None, image_size=None, defer_blocks=None, defer_bytes=None):
         """
         The class constructor. The parameters are:
             image      - file-like object of the image which should be copied,
@@ -176,6 +176,11 @@ class BmapCopy(object):
 
         self._f_image = image
         self._image_path = image.name
+
+        self._f_defer = defer_obj
+        self._defer_bytes = defer_bytes
+        self._defer_blocks = defer_blocks
+        self._defer_batch_queue = None
 
         self._f_dest = dest
         self._dest_path = dest.name
@@ -389,8 +394,8 @@ class BmapCopy(object):
         """
 
         if self.mapped_cnt:
-            assert blocks_written <= self.mapped_cnt
-            percent = int((float(blocks_written) / self.mapped_cnt) * 100)
+            assert blocks_written <= (self.mapped_cnt + self._defer_blocks)
+            percent = int((float(blocks_written) / (self.mapped_cnt + self._defer_blocks)) * 100)
             _log.debug("wrote %d blocks out of %d (%d%%)" %
                        (blocks_written, self.mapped_cnt, percent))
         else:
@@ -514,7 +519,7 @@ class BmapCopy(object):
         if batch_blocks:
             yield (first, first + batch_blocks - 1, batch_blocks)
 
-    def _get_data(self, verify):
+    def _get_data(self, image, verify):
         """
         This is generator  which reads the image file in '_batch_blocks' chunks
         and yields ('type', 'start', 'end',  'buf) tuples, where:
@@ -529,12 +534,12 @@ class BmapCopy(object):
                 if verify and chksum:
                     hash_obj = hashlib.new(self._cs_type)
 
-                self._f_image.seek(first * self.block_size)
+                image.seek(first * self.block_size)
 
                 iterator = self._get_batches(first, last)
                 for (start, end, length) in iterator:
                     try:
-                        buf = self._f_image.read(length * self.block_size)
+                        buf = image.read(length * self.block_size)
                     except IOError as err:
                         raise Error("error while reading blocks %d-%d of the "
                                     "image file '%s': %s"
@@ -578,19 +583,27 @@ class BmapCopy(object):
         return.  The 'verify' argument defines whether the checksum has to be
         verified while copying.
         """
-
         # Create the queue for block batches and start the reader thread, which
         # will read the image in batches and put the results to '_batch_queue'.
         self._batch_queue = Queue.Queue(self._batch_queue_len)
-        thread.start_new_thread(self._get_data, (verify, ))
-
+        thread.start_new_thread(self._get_data, (self._f_image, verify, ))
         blocks_written = 0
         bytes_written = 0
         fsync_last = 0
+        defer_write_done = False 
 
         self._progress_started = False
         self._progress_index = 0
         self._progress_time = datetime.datetime.now()
+        
+        if not self._defer_blocks:
+            self._defer_blocks = 0
+
+        if self._defer_bytes:
+            self._defer_blocks = (self._defer_bytes + self.block_size - 1) // self.block_size
+
+        if self._defer_blocks > self.mapped_cnt:
+            raise Error("defer range cannot exceed mapped block")
 
         if self.image_size and self._dest_is_regfile:
             # If we already know image size, make sure that destination file
@@ -618,8 +631,13 @@ class BmapCopy(object):
 
             assert len(buf) <= (end - start + 1) * self.block_size
             assert len(buf) > (end - start) * self.block_size
-
-            self._f_dest.seek(start * self.block_size)
+            if self._defer_blocks > 0 and start <= self._defer_blocks:
+                self._f_defer.seek(start * self.block_size)
+            else:
+                if not defer_write_done:
+                    self._defer_blocks = blocks_written
+                    defer_write_done = True
+                self._f_dest.seek(start * self.block_size)
 
             # Synchronize the destination file if we reached the watermark
             if self._dest_fsync_watermark:
@@ -627,11 +645,19 @@ class BmapCopy(object):
                     fsync_last = blocks_written
                     self.sync()
 
-            try:
-                self._f_dest.write(buf)
-            except IOError as err:
-                raise Error("error while writing blocks %d-%d of '%s': %s"
-                            % (start, end, self._dest_path, err))
+            if self._defer_blocks > 0 and start <= self._defer_blocks:
+                try:
+                    self._f_defer.write(buf)
+                    self._f_defer.flush()
+                except IOError as err:
+                    raise Error("error while writing defer blocks %d-%d of '%s': %s"
+                                % (start, end, self._dest_path, err))
+            else:    
+                try:
+                    self._f_dest.write(buf)
+                except IOError as err:
+                    raise Error("error while writing blocks %d-%d of '%s': %s"
+                                % (start, end, self._dest_path, err))
 
             self._batch_queue.task_done()
             blocks_written += (end - start + 1)
@@ -639,13 +665,38 @@ class BmapCopy(object):
 
             self._update_progress(blocks_written)
 
+        if self._defer_blocks > 0:
+            thread.start_new_thread(self._get_data, (self._f_defer, verify,))
+            while True:
+                batch = self._batch_queue.get()
+                if batch is None:
+                    break
+                (start, end, buf) = batch[1:4]
+
+                assert len(buf) <= (end - start + 1) * self.block_size
+                assert len(buf) > (end - start) * self.block_size
+                self._f_dest.seek(start * self.block_size)
+
+                if self._dest_fsync_watermark:
+                    if blocks_written >= fsync_last + self._dest_fsync_watermark:
+                        fsync_last = blocks_written
+                        self.sync()
+
+                try:
+                    self._f_dest.write(buf)
+                except IOError as err:
+                        raise Error("error while writing defer blocks to _f_dest")
+                self._batch_queue.task_done()
+                blocks_written += (end - start + 1)
+                self._update_progress(blocks_written)
+
         if not self.image_size:
             # The image size was unknown up until now, set it
             self._set_image_size(bytes_written)
 
         # This is just a sanity check - we should have written exactly
         # 'mapped_cnt' blocks.
-        if blocks_written != self.mapped_cnt:
+        if blocks_written != (self.mapped_cnt + self._defer_blocks):
             raise Error("wrote %u blocks from image '%s' to '%s', but should "
                         "have %u - bmap file '%s' does not belong to this "
                         "image"
@@ -690,14 +741,14 @@ class BmapBdevCopy(BmapCopy):
     scheduler.
     """
 
-    def __init__(self, image, dest, bmap=None, image_size=None):
+    def __init__(self, image, dest, defer_obj=None, bmap=None, image_size=None, defer_blocks=None, defer_bytes=None):
         """
         The same as the constructor of the 'BmapCopy' base class, but adds
         useful guard-checks specific to block devices.
         """
 
         # Call the base class constructor first
-        BmapCopy.__init__(self, image, dest, bmap, image_size)
+        BmapCopy.__init__(self, image, dest, defer_obj, bmap, image_size, defer_blocks, defer_bytes)
 
         self._dest_fsync_watermark = (6 * 1024 * 1024) // self.block_size
 
