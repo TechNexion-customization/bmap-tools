@@ -588,6 +588,7 @@ class BmapCopy(object):
         self._batch_queue = Queue.Queue(self._batch_queue_len)
         thread.start_new_thread(self._get_data, (self._f_image, verify, ))
         blocks_written = 0
+        defer_blocks_written = 0
         bytes_written = 0
         fsync_last = 0
         defer_write_done = False 
@@ -602,7 +603,7 @@ class BmapCopy(object):
         if self._defer_bytes:
             self._defer_blocks = (self._defer_bytes + self.block_size - 1) // self.block_size
 
-        if self._defer_blocks > self.mapped_cnt:
+        if self.mapped_cnt and self._defer_blocks > self.mapped_cnt:
             raise Error("defer range cannot exceed mapped block")
 
         if self.image_size and self._dest_is_regfile:
@@ -635,7 +636,7 @@ class BmapCopy(object):
                 self._f_defer.seek(start * self.block_size)
             else:
                 if not defer_write_done:
-                    self._defer_blocks = blocks_written
+                    self._defer_blocks = defer_blocks_written
                     defer_write_done = True
                 self._f_dest.seek(start * self.block_size)
 
@@ -645,7 +646,7 @@ class BmapCopy(object):
                     fsync_last = blocks_written
                     self.sync()
 
-            if self._defer_blocks > 0 and start <= self._defer_blocks:
+            if not defer_write_done:
                 try:
                     self._f_defer.write(buf)
                     self._f_defer.flush()
@@ -660,8 +661,11 @@ class BmapCopy(object):
                                 % (start, end, self._dest_path, err))
 
             self._batch_queue.task_done()
-            blocks_written += (end - start + 1)
-            bytes_written += len(buf)
+            if not defer_write_done:
+                defer_blocks_written += (end - start + 1)
+            else:
+                blocks_written += (end - start + 1)
+                bytes_written += len(buf)
 
             self._update_progress(blocks_written)
 
@@ -688,6 +692,7 @@ class BmapCopy(object):
                         raise Error("error while writing defer blocks to _f_dest")
                 self._batch_queue.task_done()
                 blocks_written += (end - start + 1)
+                bytes_written += len(buf)
                 self._update_progress(blocks_written)
 
         if not self.image_size:
@@ -696,7 +701,7 @@ class BmapCopy(object):
 
         # This is just a sanity check - we should have written exactly
         # 'mapped_cnt' blocks.
-        if blocks_written != (self.mapped_cnt + self._defer_blocks):
+        if (blocks_written + defer_blocks_written) != (self.mapped_cnt + self._defer_blocks):
             raise Error("wrote %u blocks from image '%s' to '%s', but should "
                         "have %u - bmap file '%s' does not belong to this "
                         "image"
