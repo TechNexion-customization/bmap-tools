@@ -98,7 +98,7 @@ class NamedFile(object):
     def __getattr__(self, name):
         return getattr(self._file_obj, name)
 
-def open_block_device(path):
+def open_block_device(path, ignore_excl):
     """
     This is a helper function for 'open_files()' which is called if the
     destination file of the "copy" command is a block device. We handle block
@@ -113,7 +113,10 @@ def open_block_device(path):
     """
 
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_EXCL)
+        if ignore_excl:
+            descriptor = os.open(path, os.O_WRONLY)
+        else:
+            descriptor = os.open(path, os.O_WRONLY | os.O_EXCL)
     except OSError as err:
         error_out("cannot open block device '%s' in exclusive mode: %s",
                   path, err)
@@ -417,7 +420,7 @@ def open_files(args):
     dest_is_blkdev = stat.S_ISBLK(os.fstat(dest_obj.fileno()).st_mode)
     if dest_is_blkdev:
         dest_obj.close()
-        dest_obj = open_block_device(args.dest)
+        dest_obj = open_block_device(args.dest, args.ignore_excl)
 
     defer_obj = None
     if args.blocks_defer or args.bytes_defer:
@@ -646,6 +649,10 @@ def parse_arguments():
     # The --nobmap option
     text = "allow copying without a bmap file"
     parser_copy.add_argument("--nobmap", action="store_true", help=text)
+
+    # The --ignore-excl option
+    text = "allow copying without a bmap file"
+    parser_copy.add_argument("--ignore-excl", action="store_true", help=text)
 
     # The --bmap-sig option
     text = "the detached GPG signature for the bmap file"
