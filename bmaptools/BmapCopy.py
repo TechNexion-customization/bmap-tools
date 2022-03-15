@@ -667,7 +667,7 @@ class BmapCopy(object):
                 blocks_written += (end - start + 1)
                 bytes_written += len(buf)
 
-            self._update_progress(blocks_written)
+            self._update_progress(blocks_written + defer_blocks_written)
 
         if self._defer_blocks > 0:
             thread.start_new_thread(self._get_data, (self._f_defer, verify,))
@@ -693,7 +693,7 @@ class BmapCopy(object):
                 self._batch_queue.task_done()
                 blocks_written += (end - start + 1)
                 bytes_written += len(buf)
-                self._update_progress(blocks_written)
+                self._update_progress(blocks_written + defer_blocks_written)
 
         if not self.image_size:
             # The image size was unknown up until now, set it
