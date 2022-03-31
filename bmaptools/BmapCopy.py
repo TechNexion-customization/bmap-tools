@@ -603,8 +603,8 @@ class BmapCopy(object):
         if self._defer_bytes:
             self._defer_blocks = (self._defer_bytes + self.block_size - 1) // self.block_size
 
-        if self.mapped_cnt and self._defer_blocks > self.mapped_cnt:
-            raise Error("defer range cannot exceed mapped block")
+        # if self.mapped_cnt and self._defer_blocks > self.mapped_cnt:
+        #     raise Error("defer range cannot exceed mapped block")
 
         if self.image_size and self._dest_is_regfile:
             # If we already know image size, make sure that destination file
