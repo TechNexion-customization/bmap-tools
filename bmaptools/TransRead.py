@@ -576,7 +576,7 @@ class TransRead(object):
         # environment variables propely, there will be a very long delay before
         # the failure message. And it is much nicer to pre-warn the user early
         # about something possibly being wrong.
-        for timeout in (10, None):
+        for timeout in (10, 30):
             try:
                 f_obj = opener.open(url, timeout=timeout)
             # Handling the timeout case in Python 2.7
